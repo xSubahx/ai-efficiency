@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Async",
+    "description": "One board for asynchronous agent work: what is running now, what is scheduled, and what needs your answer. Kanban columns for lifecycle state over a shared time axis, with a full timeline view and per-item executors.",
+    "detail": "docs/DETAIL.md"
+  }
+}

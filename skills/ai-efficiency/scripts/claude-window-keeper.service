@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep Claude 5-hour usage windows aligned (tiny Haiku ping ~75 s after each reset)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-window-keeper run
+Restart=always
+RestartSec=60
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+
+[Install]
+WantedBy=default.target

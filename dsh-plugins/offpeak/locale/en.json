@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Off-peak only",
+    "description": "Queue a prompt for the next off-peak window when it would otherwise run during peak hours. Switch it off per chat from the model menu; the default lives in Settings.",
+    "detail": "docs/DETAIL.md"
+  }
+}

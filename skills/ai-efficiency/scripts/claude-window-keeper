@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""claude-window-keeper - keep Claude's 5-hour usage windows phase-aligned.
+
+A Claude subscription window opens with your first message and resets five hours
+later. Start work at 10:40 and the window runs to 15:40, wherever your day's real
+peaks are. This daemon sends a tiny Haiku "hi" through the official Claude Code CLI
+about a minute after each reset during keep-alive hours, so a window is already
+running when you reach for Claude and the next reset is never far away.
+
+The next ping is scheduled from the real reset time that Claude Code reports
+(stream-json `rate_limit_event`), so windows started anywhere else (another
+device, the phone, claude.ai) are followed, not guessed. Pings stop for the night
+at `until` and restart at `anchor`, which re-aligns the window phase every day
+(5 h does not divide 24 h, so an unbroken chain would drift ~1 h per day).
+
+Run it on ONE always-on machine per account: the window belongs to the account,
+not the device. It changes when windows start, never how much a window or the
+week holds.
+
+Individual days can differ from the daily rule: config "overrides" maps a date
+(YYYY-MM-DD, the day the keep-alive span starts) to {"anchor", "until"} or {"off": true}.
+
+Usage: claude-window-keeper run | status | ping | next | pause | resume
+       claude-window-keeper json [--from TS] [--to TS]
+       claude-window-keeper set --date YYYY-MM-DD [--days N] (--anchor HH:MM --until HH:MM | --off | --clear)
+       claude-window-keeper set --all --anchor HH:MM --until HH:MM
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+# CLAUDE_WINDOW_HOME moves config and state under one folder (handy for a dry run).
+_BASE = os.environ.get("CLAUDE_WINDOW_HOME")
+CFG_PATH = pathlib.Path(_BASE) / "config.json" if _BASE else HOME / ".config/claude-window/config.json"
+STATE_DIR = pathlib.Path(_BASE) / "state" if _BASE else HOME / ".local/state/claude-window"
+STATE_PATH = STATE_DIR / "state.json"
+LOG_PATH = STATE_DIR / "pings.jsonl"
+EMPTY_CWD = STATE_DIR / "empty"  # no CLAUDE.md, no project settings
+
+WINDOW_S = 5 * 3600
+MIN_GAP_S = 60                       # never ping more often than this
+BACKOFF_S = [120, 300, 600, 1200, 1800]
+
+DEFAULTS = {
+    "enabled": True,
+    "anchor": "06:00",              # first ping of the day
+    "until": "01:00",               # no new window started after this (window then ends by the anchor)
+    "delay_after_reset_s": 75,      # "a minute or so" after the reset
+    "model": "haiku",
+    "prompt": "hi",
+    "system_prompt": "Reply with one word.",
+    "claude": shutil.which("claude") or str(HOME / ".local/bin/claude"),
+    "timeout_s": 120,
+}
+
+
+# ---------------------------------------------------------------- config/state
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CFG_PATH.read_text()))
+    except FileNotFoundError:
+        CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CFG_PATH.write_text(json.dumps(DEFAULTS, indent=2) + "\n")
+    return cfg
+
+
+def save_cfg(cfg):
+    # Overrides for days that are over are dropped on every write.
+    keep = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    cfg["overrides"] = {d: v for d, v in sorted((cfg.get("overrides") or {}).items()) if d >= keep}
+    tmp = CFG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(CFG_PATH)
+
+
+def save_cfg_key(key, value):
+    cfg = load_cfg()
+    cfg[key] = value
+    save_cfg(cfg)
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    tmp.replace(STATE_PATH)
+
+
+# ---------------------------------------------------------------- scheduling
+def _hm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def day_rule(cfg, day):
+    """The rule for one schedule day: {"anchor", "until", "override"}, or None when skipped."""
+    ov = (cfg.get("overrides") or {}).get(day.isoformat())
+    if ov and ov.get("off"):
+        return None
+    return {"anchor": (ov or {}).get("anchor", cfg["anchor"]), "until": (ov or {}).get("until", cfg["until"]),
+            "override": bool(ov)}
+
+
+def day_span(cfg, day):
+    """(start, end) epoch seconds of a day's keep-alive span; `until` at or before `anchor` means the next day."""
+    r = day_rule(cfg, day)
+    if not r:
+        return None
+    a, u = _hm(r["anchor"]), _hm(r["until"])
+    d0 = dt.datetime.combine(day, dt.time())
+    end = d0 + dt.timedelta(minutes=u) + (dt.timedelta(days=1) if u <= a else dt.timedelta())
+    return (d0 + dt.timedelta(minutes=a)).timestamp(), end.timestamp()
+
+
+def span_at(ts, cfg):
+    """(day, start, end) of the span that covers ts, or None."""
+    d = dt.date.fromtimestamp(ts)
+    for day in (d, d - dt.timedelta(days=1)):
+        sp = day_span(cfg, day)
+        if sp and sp[0] <= ts <= sp[1]:
+            return day, sp[0], sp[1]
+    return None
+
+
+def allowed(ts, cfg):
+    """May a window be started at local time ts?"""
+    return span_at(ts, cfg) is not None
+
+
+def next_anchor(after_ts, cfg):
+    """Start of the first span after ts (skipped days have none)."""
+    d = dt.date.fromtimestamp(after_ts)
+    for k in range(-1, 120):
+        sp = day_span(cfg, d + dt.timedelta(days=k))
+        if sp and sp[0] > after_ts:
+            return sp[0]
+    return after_ts + 86400
+
+
+def plan(st, cfg, now):
+    """Epoch time of the next ping."""
+    if st.get("retry_at") and st["retry_at"] > now:
+        return st["retry_at"]
+    reset = st.get("five_hour_resets_at")
+    cand = reset + cfg["delay_after_reset_s"] if reset and reset > now - 60 else now
+    if st.get("blocked_until") and st["blocked_until"] > cand:      # weekly cap exhausted
+        cand = st["blocked_until"] + cfg["delay_after_reset_s"]
+    cand = max(cand, st.get("last_ping", 0) + MIN_GAP_S)
+    return cand if allowed(cand, cfg) else next_anchor(cand, cfg)
+
+
+# ---------------------------------------------------------------- the ping
+def ping(cfg):
+    EMPTY_CWD.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    # An API key in the environment would bill the Console and never touch the plan's window.
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
+        env.pop(k, None)
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    cmd = [cfg["claude"], "-p", "--model", cfg["model"], "--tools", "", "--strict-mcp-config",
+           "--no-session-persistence", "--disable-slash-commands", "--setting-sources", "",
+           "--system-prompt", cfg["system_prompt"], "--output-format", "stream-json", "--verbose",
+           cfg["prompt"]]
+    t0 = time.time()
+    rec = {"ts": round(t0), "ok": False}
+    try:
+        p = subprocess.run(cmd, cwd=EMPTY_CWD, env=env, capture_output=True, text=True,
+                           timeout=cfg["timeout_s"])
+        out, rec["exit"] = p.stdout, p.returncode
+        if p.returncode and p.stderr.strip():
+            rec["stderr"] = p.stderr.strip()[-300:]
+    except subprocess.TimeoutExpired:
+        rec["error"] = "timeout"
+        return rec
+    except OSError as e:
+        rec["error"] = f"cannot run claude: {e}"
+        return rec
+    for line in out.splitlines():
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = o.get("type")
+        if t == "system" and o.get("subtype") == "init":
+            rec["auth"] = o.get("apiKeySource")
+            rec["model"] = o.get("model")
+        elif t == "rate_limit_event":
+            info = o.get("rate_limit_info") or {}
+            rec["status"] = info.get("status")
+            rec["limit_type"] = info.get("rateLimitType")
+            for name, w in (info.get("unifiedWindows") or {}).items():
+                rec[name] = {"utilization": w.get("utilization"), "resets_at": w.get("resetsAt")}
+            if "five_hour" not in rec and info.get("rateLimitType") == "five_hour":
+                rec["five_hour"] = {"utilization": info.get("utilization"), "resets_at": info.get("resetsAt")}
+            if info.get("status") == "rejected" and info.get("rateLimitType") not in (None, "five_hour"):
+                rec["blocked_until"] = info.get("resetsAt")
+        elif t == "result":
+            rec["ok"] = not o.get("is_error")
+            rec["reply"] = (o.get("result") or "")[:200]
+            u = o.get("usage") or {}
+            rec["tokens"] = sum(u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                       "cache_read_input_tokens", "output_tokens"))
+    fh = (rec.get("five_hour") or {}).get("resets_at")
+    if fh:
+        rec["started_window"] = fh - t0 >= WINDOW_S - 300
+    if rec.get("auth") not in (None, "none"):
+        rec["warning"] = f"pinged with {rec['auth']}, not the subscription: the plan window was not touched"
+    if not rec["ok"] and "error" not in rec:
+        text = (rec.get("reply", "") + " " + rec.get("stderr", "")).lower()
+        rec["error"] = "auth: run `claude` then /login on this machine" if ("login" in text or "401" in text or "authentication" in text) else (rec.get("reply") or rec.get("stderr") or "ping failed")[:200]
+    return rec
+
+
+def apply(st, rec):
+    st["last_ping"] = rec["ts"]
+    st["last"] = rec
+    if rec.get("five_hour", {}).get("resets_at"):
+        st["five_hour_resets_at"] = rec["five_hour"]["resets_at"]
+        st["five_hour_utilization"] = rec["five_hour"].get("utilization")
+    if rec.get("seven_day"):
+        st["seven_day"] = rec["seven_day"]
+    st["blocked_until"] = rec.get("blocked_until")
+    if rec.get("five_hour") or rec.get("blocked_until"):
+        st["failures"] = 0
+        st.pop("retry_at", None)
+    else:                                   # no rate-limit info at all: back off and try again
+        n = st.get("failures", 0)
+        st["failures"] = n + 1
+        st["retry_at"] = rec["ts"] + BACKOFF_S[min(n, len(BACKOFF_S) - 1)]
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return st
+
+
+# ---------------------------------------------------------------- output
+def fmt_t(ts, now=None):
+    if not ts:
+        return "-"
+    t = dt.datetime.fromtimestamp(ts)
+    now = now or time.time()
+    day = "" if t.date() == dt.date.today() else t.strftime("%a %d %b ")
+    rel = ts - now
+    h, m = divmod(int(abs(rel)) // 60, 60)
+    span = f"{h}h{m:02d}m" if h else f"{m}m"
+    return f"{day}{t:%H:%M:%S} ({'in ' + span if rel >= 0 else span + ' ago'})"
+
+
+def pct(x):
+    return "?" if x is None else f"{round(100 * x)}%"
+
+
+def describe(rec):
+    if rec.get("error"):
+        return f"FAILED: {rec['error']}"
+    fh = rec.get("five_hour") or {}
+    start = fh.get("resets_at", 0) - WINDOW_S
+    what = "started a new window" if rec.get("started_window") else f"window already open (since {dt.datetime.fromtimestamp(start):%H:%M})"
+    wk = (rec.get("seven_day") or {}).get("utilization")
+    return f"{what}; 5h {pct(fh.get('utilization'))} used, week {pct(wk)}"
+
+
+def cmd_status(_):
+    cfg, st, now = load_cfg(), load_state(), time.time()
+    on = "ENABLED" if cfg["enabled"] else "PAUSED (claude-window-keeper resume)"
+    print(f"claude-window-keeper: {on}; pings {cfg['anchor']}->{cfg['until']}, {cfg['delay_after_reset_s']} s after each reset, model {cfg['model']}")
+    r = st.get("five_hour_resets_at")
+    if r and r > now:
+        print(f"5h window : {dt.datetime.fromtimestamp(r - WINDOW_S):%H:%M} -> resets {fmt_t(r, now)}; {pct(st.get('five_hour_utilization'))} used at last ping")
+    else:
+        print("5h window : none open as of the last ping" + (f" (last reset {fmt_t(r, now)})" if r else ""))
+    sd = st.get("seven_day") or {}
+    if sd:
+        print(f"weekly    : {pct(sd.get('utilization'))} used, resets {fmt_t(sd.get('resets_at'), now)}")
+    if cfg["enabled"]:
+        print(f"next ping : {fmt_t(plan(st, cfg, now), now)}")
+    for d, v in sorted((cfg.get("overrides") or {}).items()):
+        if d >= dt.date.today().isoformat():
+            print(f"change    : {dt.date.fromisoformat(d):%a %d %b} " + ("skipped" if v.get("off") else f"{v['anchor']}->{v['until']}"))
+    if st.get("failures"):
+        print(f"WARNING   : {st['failures']} failed ping(s) in a row; last: {(st.get('last') or {}).get('error')}")
+    try:
+        lines = LOG_PATH.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    recs = [json.loads(l) for l in lines if l.strip()]
+    week = [x for x in recs if x["ts"] > now - 7 * 86400]
+    started = sum(1 for x in week if x.get("started_window"))
+    print(f"last 7 d  : {len(week)} pings, {started} started a window, {sum(1 for x in week if x.get('error'))} failed")
+    for x in recs[-8:]:
+        print(f"  {dt.datetime.fromtimestamp(x['ts']):%a %H:%M}  {describe(x)}")
+
+
+def cmd_next(_):
+    """Projected pings for the next 24 h, assuming nobody else starts a window."""
+    cfg, st, now = load_cfg(), load_state(), time.time()
+    sim = dict(st)
+    start = now
+    for _ in range(8):
+        t = plan(sim, cfg, now)
+        if t > start + 86400:
+            break
+        reset = sim.get("five_hour_resets_at") or 0
+        end = reset if reset > t else t + WINDOW_S      # lands in an open window, or starts one
+        print(f"  {fmt_t(t, start)}  -> window until {dt.datetime.fromtimestamp(end):%a %H:%M}")
+        sim.update(five_hour_resets_at=end, last_ping=t)
+        sim.pop("retry_at", None)
+        now = t
+
+
+def cmd_ping(_):
+    cfg, st = load_cfg(), load_state()
+    rec = ping(cfg)
+    save_state(apply(st, rec))
+    print(describe(rec))
+    return 0 if not rec.get("error") else 1
+
+
+def cmd_run(_):
+    print("claude-window-keeper running", flush=True)
+    while True:
+        cfg, st, now = load_cfg(), load_state(), time.time()
+        if not cfg["enabled"]:
+            time.sleep(300)
+            continue
+        due = plan(st, cfg, now)
+        if due > now:
+            time.sleep(min(due - now, 300))       # wake regularly so config edits apply
+            continue
+        rec = ping(cfg)
+        st = apply(st, rec)
+        save_state(st)
+        print(f"ping: {describe(rec)}; next {fmt_t(plan(st, cfg, time.time()))}", flush=True)
+        if rec.get("warning"):
+            print("WARNING: " + rec["warning"], flush=True)
+
+
+def project(st, cfg, now, to):
+    """Pings from now until `to`, assuming nobody else opens a window."""
+    out = []
+    if not cfg["enabled"]:
+        return out
+    sim, t = dict(st), now
+    for _ in range(2000):
+        p = plan(sim, cfg, t)
+        if p > to:
+            break
+        sp = span_at(p, cfg)
+        out.append({"t": round(p), "end": round(p) + WINDOW_S, "day": sp[0].isoformat() if sp else None,
+                    "first": bool(sp and abs(p - sp[1]) < 1)})
+        sim.update(five_hour_resets_at=p + WINDOW_S, last_ping=p, blocked_until=None)
+        sim.pop("retry_at", None)
+        t = p
+    return out
+
+
+def cmd_json(a):
+    cfg, st, now = load_cfg(), load_state(), time.time()
+    frm = a.frm if a.frm is not None else now - 86400
+    to = a.to if a.to is not None else now + 7 * 86400
+    try:
+        recs = [json.loads(l) for l in LOG_PATH.read_text().splitlines() if l.strip()]
+    except FileNotFoundError:
+        recs = []
+    today = dt.date.today()
+    days = []
+    for k in range(-1, 15):
+        d = today + dt.timedelta(days=k)
+        r = day_rule(cfg, d)
+        sp = day_span(cfg, d)
+        days.append({"date": d.isoformat(), "off": r is None, "anchor": r and r["anchor"], "until": r and r["until"],
+                     "override": (r or {}).get("override", d.isoformat() in (cfg.get("overrides") or {})),
+                     "start": sp and round(sp[0]), "end": sp and round(sp[1])})
+    print(json.dumps({
+        "now": now, "config": {k: cfg[k] for k in ("enabled", "anchor", "until", "delay_after_reset_s", "model", "prompt")},
+        "overrides": cfg.get("overrides") or {}, "state": st, "days": days,
+        "next": plan(st, cfg, now) if cfg["enabled"] else None,
+        "projection": project(st, cfg, now, min(to, now + 400 * 86400)) if to > now else [],
+        "pings": [r for r in recs if r.get("ts", 0) >= frm - WINDOW_S and r.get("ts", 0) <= to],
+        "recent": recs[-30:],
+    }))
+
+
+def cmd_set(a):
+    cfg = load_cfg()
+    hhmm = lambda s: s and dt.datetime.strptime(s, "%H:%M").strftime("%H:%M")
+    if a.all:
+        if not (a.anchor and a.until):
+            raise SystemExit("--all needs --anchor and --until")
+        cfg["anchor"], cfg["until"] = hhmm(a.anchor), hhmm(a.until)
+        today = dt.date.today().isoformat()
+        cfg["overrides"] = {d: v for d, v in (cfg.get("overrides") or {}).items() if d < today}
+    else:
+        if not a.date:
+            raise SystemExit("set needs --date (or --all)")
+        start = dt.date.fromisoformat(a.date)
+        if start < dt.date.today() - dt.timedelta(days=1):
+            raise SystemExit("that day is over")
+        ov = dict(cfg.get("overrides") or {})
+        for k in range(max(1, min(a.days, 366))):
+            d = (start + dt.timedelta(days=k)).isoformat()
+            if a.clear:
+                ov.pop(d, None)
+            elif a.off:
+                ov[d] = {"off": True}
+            elif a.anchor and a.until:
+                v = {"anchor": hhmm(a.anchor), "until": hhmm(a.until)}
+                if v == {"anchor": cfg["anchor"], "until": cfg["until"]}:
+                    ov.pop(d, None)          # same as the daily rule: no exception needed
+                else:
+                    ov[d] = v
+            else:
+                raise SystemExit("set needs --anchor and --until, --off or --clear")
+        cfg["overrides"] = ov
+    save_cfg(cfg)
+    print(json.dumps({"ok": True, "anchor": cfg["anchor"], "until": cfg["until"], "overrides": cfg["overrides"]}))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    for name in ("run", "status", "ping", "next", "pause", "resume"):
+        sub.add_parser(name)
+    j = sub.add_parser("json")
+    j.add_argument("--from", dest="frm", type=float)
+    j.add_argument("--to", type=float)
+    s = sub.add_parser("set")
+    s.add_argument("--date")
+    s.add_argument("--days", type=int, default=1)
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--anchor")
+    s.add_argument("--until")
+    s.add_argument("--off", action="store_true")
+    s.add_argument("--clear", action="store_true")
+    a = ap.parse_args()
+    if a.cmd == "pause":
+        save_cfg_key("enabled", False)
+        print("paused")
+        return 0
+    if a.cmd == "resume":
+        save_cfg_key("enabled", True)
+        print("resumed")
+        return 0
+    return {"run": cmd_run, "ping": cmd_ping, "next": cmd_next, "json": cmd_json, "set": cmd_set}.get(a.cmd, cmd_status)(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
